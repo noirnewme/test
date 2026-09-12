@@ -2,8 +2,9 @@
   "name": "nusa-bot-worker",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "start": "node discord/register-commands.mjs && node discord/bot.mjs"
+    "start": "node register-commands.mjs && node bot.mjs"
   },
   "dependencies": {
     "discord.js": "^14.14.0",
