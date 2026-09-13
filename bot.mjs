@@ -13,6 +13,12 @@ function randomCode(length = 10) {
   return Array.from(bytes, b => chars[b % chars.length]).join('');
 }
 
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derivedHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return `${salt}:${derivedHash}`;
+}
+
 async function discord(path, init = {}) {
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bot ${process.env.DISCORD_BOT_TOKEN}`);
@@ -20,25 +26,10 @@ async function discord(path, init = {}) {
   return fetch(apiBase + path, { ...init, headers });
 }
 
-async function resolveRobloxUsername(username) {
-  const r = await fetch('https://users.roblox.com/v1/usernames/users', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ usernames: [username], excludeBannedUsers: false })
-  });
-  if (!r.ok) throw new Error(`Roblox API returned ${r.status}`);
-  const data = await r.json();
-  return data.data?.[0] || null;
-}
-
 async function getGuildMember(userId) {
   const r = await discord(`/guilds/${process.env.DISCORD_GUILD_ID}/members/${userId}`);
   if (!r.ok) return null;
   return r.json();
-}
-
-async function isAdmin(userId) {
-  const m = await getGuildMember(userId);
-  return !!m?.roles?.includes(process.env.DISCORD_ADMIN_ROLE_ID);
 }
 
 async function handleVerify(interaction) {
@@ -110,29 +101,63 @@ async function handleVerify(interaction) {
 
   return `✅ Verified **${data.roblox.name}**. I sent your verification code to your Discord DM.${roleWarning}${nicknameWarning}`;
 }
+
 async function handleAccountCreate(interaction) {
-  if (!(await isAdmin(interaction.user.id))) return '❌ You need the configured admin role to use this command.';
-  const target = interaction.options.getUser('user', true);
   const email = interaction.options.getString('email', true).trim().toLowerCase();
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return 'Invalid email.';
-  const member = await getGuildMember(target.id);
-  if (!member) return 'That Discord member is not in the configured guild.';
-  await pool.query(`INSERT INTO accounts(discord_user_id,discord_username,email,created_by_discord_user_id)
-    VALUES($1,$2,$3,$4)
-    ON CONFLICT(discord_user_id) DO UPDATE SET discord_username=excluded.discord_username,email=excluded.email,disabled_at=NULL`,
-    [target.id, member.user.username, email, interaction.user.id]);
-  await pool.query('INSERT INTO audit_logs(actor_type,actor_id,action,target_id,metadata) VALUES($1,$2,$3,$4,$5)',
-    ['discord', interaction.user.id, 'account-create', target.id, JSON.stringify({ email, gateway: true })]);
-  return `✅ Website account created for <@${target.id}> with **${email}**.`;
+  const password = interaction.options.getString('password', true);
+
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return '❌ Invalid email format.';
+
+  const passwordHash = hashPassword(password);
+  const staffDiscordId = interaction.user.id;
+
+  await pool.query(
+    `INSERT INTO accounts(email, password_hash, created_by_discord_user_id) 
+     VALUES($1, $2, $3) 
+     ON CONFLICT(email) DO UPDATE SET password_hash = excluded.password_hash`,
+    [email, passwordHash, staffDiscordId]
+  );
+
+  await pool.query(
+    'INSERT INTO audit_logs(actor_type, actor_id, action, target_id, metadata) VALUES($1, $2, $3, $4, $5)',
+    ['discord', staffDiscordId, 'account-create', 'none', JSON.stringify({ email })]
+  );
+
+  try {
+    await interaction.user.send(
+      `✅ **Website Account Created Successfully**\n\n` +
+      `**Email:** ${email}\n` +
+      `**Password:** ${password}\n\n` +
+      `Keep these credentials secure. You can now use them to log into the /admin panel.`
+    );
+  } catch (e) {
+    console.error('Account creation DM failed:', e);
+    return `✅ Account created for **${email}**, but I could not send the credentials via DM. Please check your Discord privacy settings to allow DMs from server members.`;
+  }
+
+  return `✅ Account created successfully! I have sent the login credentials to your Discord Direct Messages.`;
 }
 
 const commands = [
-  { name: 'verify', description: 'Verify a Roblox account and generate a redeem code.', options: [{ name: 'roblox-username', description: 'Roblox username to verify.', type: 3, required: true }] },
-  { name: 'account-create', description: 'Create or update a website account for a Discord member.', default_member_permissions: String(0x8), options: [{ name: 'user', description: 'Discord member.', type: 6, required: true }, { name: 'email', description: 'Email used for OTP login.', type: 3, required: true }] }
+  { 
+    name: 'verify', 
+    description: 'Verify a Roblox account and generate a redeem code.', 
+    options: [{ name: 'roblox-username', description: 'Roblox username to verify.', type: 3, required: true }] 
+  },
+  { 
+    name: 'account-create', 
+    description: 'Create a website account (Admin Only). Credentials sent to your DM.', 
+    default_member_permissions: String(0x8), 
+    options: [
+      { name: 'email', description: 'Account email address.', type: 3, required: true },
+      { name: 'password', description: 'Account password.', type: 3, required: true }
+    ] 
+  }
 ];
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-client.once('ClientReady', async () => {
+
+client.once('ready', async () => {
   console.log(`Discord Gateway bot online as ${client.user.tag}`);
   client.user.setPresence({ status: 'online', activities: [{ name: 'Roblox Control Suite', type: 0 }] });
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
