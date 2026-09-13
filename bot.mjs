@@ -43,105 +43,72 @@ async function isAdmin(userId) {
 
 async function handleVerify(interaction) {
   const username = interaction.options.getString('roblox-username', true).trim();
-
-  // /verify is intentionally available to everyone and does NOT require
-  // a website account. The Vercel bridge handles the Roblox lookup,
-  // Discord <-> Roblox link, and verification-code generation.
-  const appUrl = String(process.env.NEXT_PUBLIC_APP_URL || '').replace(/\/+$/, '');
+  const appUrl = String(process.env.NEXT_PUBLIC_APP_URL || '').replace(/\/$/, '');
   const internalSecret = process.env.DISCORD_BOT_INTERNAL_SECRET;
+  const memberRoleId = process.env.DISCORD_MEMBER_ROLE_ID;
 
-  if (!appUrl) throw new Error('NEXT_PUBLIC_APP_URL is not configured.');
-  if (!internalSecret) throw new Error('DISCORD_BOT_INTERNAL_SECRET is not configured.');
+  if (!appUrl) throw new Error('NEXT_PUBLIC_APP_URL is required for /verify.');
+  if (!internalSecret) throw new Error('DISCORD_BOT_INTERNAL_SECRET is required for /verify.');
+  if (!memberRoleId) throw new Error('DISCORD_MEMBER_ROLE_ID is required for /verify.');
 
+  const globalName = interaction.user.globalName || interaction.user.username;
   const response = await fetch(`${appUrl}/api/discord/verify`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${internalSecret}`,
+      Authorization: `Bearer ${internalSecret}`,
     },
     body: JSON.stringify({
       discordUserId: interaction.user.id,
       discordUsername: interaction.user.username,
-      globalName: interaction.user.globalName || interaction.user.username,
+      globalName,
       robloxUsername: username,
     }),
   });
 
-  let data = {};
+  let data;
   try {
     data = await response.json();
   } catch {
-    data = {};
+    data = { error: `Vercel returned HTTP ${response.status}.` };
   }
 
-  if (!response.ok) {
-    throw new Error(data.error || `Verification API returned HTTP ${response.status}.`);
-  }
+  if (!response.ok) return data?.error || `Verification failed (HTTP ${response.status}).`;
 
-  const member = await getGuildMember(interaction.user.id);
-  if (!member) {
-    throw new Error('You must be a member of the configured Discord server to use /verify.');
-  }
-
-  // Give the configured Member role. This does not restrict /verify for
-  // users who already have the role; they can run /verify again.
   let roleWarning = '';
-  const memberRoleId = process.env.DISCORD_MEMBER_ROLE_ID;
-  if (!memberRoleId) {
-    roleWarning = '\n\n⚠️ DISCORD_MEMBER_ROLE_ID is not configured, so I could not add the Member role.';
-  } else if (!member.roles?.includes(memberRoleId)) {
-    try {
-      const roleResponse = await discord(
-        `/guilds/${process.env.DISCORD_GUILD_ID}/members/${interaction.user.id}/roles/${memberRoleId}`,
-        { method: 'PUT' }
-      );
-      if (!roleResponse.ok) {
-        const roleText = await roleResponse.text().catch(() => '');
-        console.error('Member role update failed:', roleResponse.status, roleText);
-        roleWarning = '\n\n⚠️ Verification succeeded, but I could not add the Member role. Check Manage Roles and role hierarchy.';
-      }
-    } catch (e) {
-      console.error('Member role update failed:', e);
-      roleWarning = '\n\n⚠️ Verification succeeded, but I could not add the Member role. Check Manage Roles and role hierarchy.';
-    }
+  try {
+    await interaction.guild.members.addRole(interaction.user.id, memberRoleId, 'Roblox /verify completed');
+  } catch (e) {
+    console.error('Member role update failed:', e);
+    roleWarning = '\n\n⚠️ Verification succeeded, but I could not add the Member role. Check Manage Roles and make sure the bot role is above the Member role.';
   }
 
-  // Update nickname to: RobloxUsername Global Name
-  const globalName = interaction.user.globalName || interaction.user.username;
   let nicknameWarning = '';
   try {
     await interaction.guild.members.edit(interaction.user.id, {
-      nick: `${data.roblox.name} ${globalName}`.slice(0, 32)
+      nick: `${data.roblox.name} ${globalName}`.slice(0, 32),
+      reason: 'Roblox /verify completed',
     });
   } catch (e) {
     console.error('Nickname update failed:', e);
-    nicknameWarning = '\n\n⚠️ Verification succeeded, but I could not change your nickname. Check Manage Nicknames and role hierarchy.';
+    nicknameWarning = '\n⚠️ I could not change your nickname. Check Manage Nicknames and the bot role hierarchy.';
   }
 
-  // Send the verification code privately. Never expose it in the public
-  // Discord channel.
-  let dmWarning = '';
   try {
     await interaction.user.send(
-      `✅ Roblox verification successful!\n\n` +
+      `✅ Roblox verification completed.\n\n` +
       `Roblox: **${data.roblox.name}**\n` +
       `Roblox User ID: **${data.roblox.id}**\n` +
-      `Verification code: **${data.code}**\n\n` +
-      `This code expires in 24 hours.`
+      `Verification code: **${data.code}**\n` +
+      `Expires in: **24 hours**\n\n` +
+      `Use this code in-game to complete the Roblox verification.`
     );
   } catch (e) {
     console.error('Verification DM failed:', e);
-    dmWarning = '\n\n⚠️ I could not DM you the verification code. Please enable DMs from server members and run `/verify` again.';
+    return `✅ Verified **${data.roblox.name}** and the Member role was processed, but I could not DM you the verification code. Please enable DMs from server members and run /verify again.${roleWarning}${nicknameWarning}`;
   }
 
-  return (
-    `✅ Verified **${data.roblox.name}** successfully.` +
-    `\n\nI linked your Discord account to Roblox and processed the Member role.` +
-    `\nThe verification code was sent to your Discord DM.` +
-    roleWarning +
-    nicknameWarning +
-    dmWarning
-  );
+  return `✅ Verified **${data.roblox.name}**. I sent your verification code to your Discord DM.${roleWarning}${nicknameWarning}`;
 }
 async function handleAccountCreate(interaction) {
   if (!(await isAdmin(interaction.user.id))) return '❌ You need the configured admin role to use this command.';
@@ -165,7 +132,7 @@ const commands = [
 ];
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-client.once('ready', async () => {
+client.once('ClientReady', async () => {
   console.log(`Discord Gateway bot online as ${client.user.tag}`);
   client.user.setPresence({ status: 'online', activities: [{ name: 'Roblox Control Suite', type: 0 }] });
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
@@ -193,6 +160,4 @@ process.on('SIGTERM', async () => { await pool.end(); client.destroy(); process.
 
 if (!process.env.DISCORD_BOT_TOKEN) throw new Error('DISCORD_BOT_TOKEN is required');
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
-if (!process.env.NEXT_PUBLIC_APP_URL) throw new Error('NEXT_PUBLIC_APP_URL is required for /verify');
-if (!process.env.DISCORD_BOT_INTERNAL_SECRET) throw new Error('DISCORD_BOT_INTERNAL_SECRET is required for /verify');
 client.login(process.env.DISCORD_BOT_TOKEN);
