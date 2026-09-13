@@ -103,6 +103,7 @@ async function handleVerify(interaction) {
 }
 
 async function handleAccountCreate(interaction) {
+  const targetUser = interaction.options.getUser('user', true);
   const email = interaction.options.getString('email', true).trim().toLowerCase();
   const password = interaction.options.getString('password', true);
 
@@ -110,32 +111,45 @@ async function handleAccountCreate(interaction) {
 
   const passwordHash = hashPassword(password);
   const staffDiscordId = interaction.user.id;
+  const targetDiscordId = targetUser.id;
+  const targetDiscordUsername = targetUser.globalName || targetUser.username;
 
-  await pool.query(
-    `INSERT INTO accounts(email, password_hash, created_by_discord_user_id) 
-     VALUES($1, $2, $3) 
-     ON CONFLICT(email) DO UPDATE SET password_hash = excluded.password_hash`,
-    [email, passwordHash, staffDiscordId]
-  );
+  try {
+    await pool.query(
+      `INSERT INTO accounts(discord_user_id, discord_username, email, password_hash, created_by_discord_user_id)
+       VALUES($1, $2, $3, $4, $5)
+       ON CONFLICT(discord_user_id) DO UPDATE SET
+         discord_username = excluded.discord_username,
+         email = excluded.email,
+         password_hash = excluded.password_hash,
+         disabled_at = NULL`,
+      [targetDiscordId, targetDiscordUsername, email, passwordHash, staffDiscordId]
+    );
+  } catch (e) {
+    if (e && e.code === '23505' && String(e.constraint).includes('email')) {
+      return `❌ The email **${email}** is already used by a different account.`;
+    }
+    throw e;
+  }
 
   await pool.query(
     'INSERT INTO audit_logs(actor_type, actor_id, action, target_id, metadata) VALUES($1, $2, $3, $4, $5)',
-    ['discord', staffDiscordId, 'account-create', 'none', JSON.stringify({ email })]
+    ['discord', staffDiscordId, 'account-create', targetDiscordId, JSON.stringify({ email, targetDiscordId })]
   );
 
   try {
-    await interaction.user.send(
-      `✅ **Website Account Created Successfully**\n\n` +
+    await targetUser.send(
+      `✅ **Website Account Created**\n\n` +
       `**Email:** ${email}\n` +
       `**Password:** ${password}\n\n` +
       `Keep these credentials secure. You can now use them to log into the /admin panel.`
     );
   } catch (e) {
     console.error('Account creation DM failed:', e);
-    return `✅ Account created for **${email}**, but I could not send the credentials via DM. Please check your Discord privacy settings to allow DMs from server members.`;
+    return `✅ Account created for **${targetDiscordUsername}** (${email}), but I could not DM them the credentials. Please check that they allow DMs from server members.`;
   }
 
-  return `✅ Account created successfully! I have sent the login credentials to your Discord Direct Messages.`;
+  return `✅ Account created successfully for **${targetDiscordUsername}**. I have sent the login credentials to their Discord Direct Messages.`;
 }
 
 const commands = [
@@ -146,9 +160,10 @@ const commands = [
   },
   { 
     name: 'account-create', 
-    description: 'Create a website account (Admin Only). Credentials sent to your DM.', 
+    description: 'Create a website account for a member (Admin Only). Credentials are sent to their DM.', 
     default_member_permissions: String(0x8), 
     options: [
+      { name: 'user', description: 'The Discord member this account is for.', type: 6, required: true },
       { name: 'email', description: 'Account email address.', type: 3, required: true },
       { name: 'password', description: 'Account password.', type: 3, required: true }
     ] 
